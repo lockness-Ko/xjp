@@ -76,7 +76,9 @@
 //!
 
 use pcap::{Capture, Device, Active};
-use etherparse::{SlicedPacket, TcpHeader, PacketBuilder, TransportSlice::Tcp};
+use etherparse::{SlicedPacket, TcpHeader, PacketBuilder, TransportSlice::Tcp, TcpOptionElement};
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 ///Enum for supported protocols
 #[derive(Debug, PartialEq)]
@@ -143,6 +145,15 @@ enum XjpTcpState {
     Closed
 }
 
+pub fn u8array2u32(ip: [u8; 4]) -> u32 {
+    let a1 = (ip[0] as u32) << 24;
+    let a2 = (ip[1] as u32) << 16;
+    let a3 = (ip[2] as u32) << 8;
+    let a4 = ip[3] as u32;
+
+    a1 | a2 | a3 | a4
+}
+
 impl XjpTcp {
     ///New TCP connection in Listen state
     // pub fn new() -> Self {
@@ -169,15 +180,42 @@ impl XjpTcp {
         self.state == XjpTcpState::FinWait1 || self.state == XjpTcpState::FinWait2 || self.state == XjpTcpState::Closing || self.state == XjpTcpState::TimeWait || self.state == XjpTcpState::CloseWait || self.state == XjpTcpState::LastAck || self.state == XjpTcpState::Closed
     }
     
+    pub fn get_tsval(&self, options: &[u8]) -> u32 {
+        let mut i: usize = 0;
+        let length = options.len();
+        
+        while i < length {
+            let kind = &options[i];
+            let len: usize = *&options[i+1] as usize;
+            if kind == &1u8 { // noop
+                continue;
+            }
+            
+            let data = &options[i+2..i+len];
+            
+            if kind == &8u8 { //tsval stuff
+                return u8array2u32(data[0..4].try_into().unwrap());
+            }
+            
+            i += len;
+        }
+        
+        0
+    }
+    
     ///Write data to the TCP connection
     ///
     ///Will return an error if the connection is closing, or closed    
-    pub fn write(&mut self, data: &[u8], cap: &mut Capture<Active>) -> Result<(), &str> {
+    pub fn write(&mut self, data: &[u8], cap: &mut Capture<Active>, tsval: u32) -> Result<(), &str> {
         if self.past_estab() {
             return Err("TCP Connection Closing!");
         }
         println!("Sending payload!");
         
+        let start = SystemTime::now();
+        let since_the_epoch = start
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards").as_millis();
         
         let builder = PacketBuilder::ethernet2([0x4c,0xd5,0x77,0xab,0x0e,0xaf], [0xff,0xff,0xff,0xff,0xff,0xff])
             .ipv4(
@@ -194,7 +232,15 @@ impl XjpTcp {
                 },                           // seq number
                 65160,                           // window size
             )
-            .syn().ack(self.seq + 1);
+            .syn()
+            .ack(self.seq + 1)
+            .options(&[
+                TcpOptionElement::Noop,
+                TcpOptionElement::WindowScale(7),
+                TcpOptionElement::SelectiveAcknowledgementPermitted,
+                TcpOptionElement::MaximumSegmentSize(1460),
+                TcpOptionElement::Timestamp(since_the_epoch as u32, tsval),
+            ]).unwrap();
 
         // self.seq += 1;
 
@@ -244,8 +290,9 @@ fn main() {
                         if header.0.syn && !header.0.ack && !header.0.fin && !header.0.psh && header.0.destination_port == 21 {
                             let seq = header.0.sequence_number;
                             let mut con = XjpTcp::from_state(XjpTcpState::SynRcvd, header.0.destination_port, header.0.source_port, seq);
+                            let tsval = con.get_tsval(header.0.options());
                             
-                            con.write(b"Hello, World!\n", &mut cap).unwrap();
+                            con.write(b"Hello, World!\n", &mut cap, tsval).unwrap();
                         }
                         
                         // if proto != Proto::Unknown {
