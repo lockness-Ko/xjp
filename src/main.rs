@@ -112,6 +112,7 @@ impl Honeypot {
 
 ///Implementation of TCP for 'hijacking connections'
 struct XjpTcp {
+    ip_addr: [u8; 4],
     state: XjpTcpState,
     src_port: u16,
     dst_port: u16,
@@ -155,8 +156,9 @@ impl XjpTcp {
     // }
     
     ///'Hijack' a connection from a state
-    pub fn from_state(state: XjpTcpState, src_port: u16, dst_port: u16, seq: u32) -> Self {
+    pub fn from_state(ip_addr: [u8; 4], state: XjpTcpState, src_port: u16, dst_port: u16, seq: u32) -> Self {
         Self {
+            ip_addr,
             state,
             src_port,
             dst_port,
@@ -179,10 +181,10 @@ impl XjpTcp {
         println!("Sending payload!");
         
         
-        let builder = PacketBuilder::ethernet2([0x4c,0xd5,0x77,0xab,0x0e,0xaf], [0xff,0xff,0xff,0xff,0xff,0xff])
+        let builder = PacketBuilder::ethernet2([0x4c,0xd5,0x77,0xab,0x0e,0xaf], [0x44, 0xad, 0xb1, 0xb5, 0x5e, 0x28])
             .ipv4(
-                [10,8,9,9], //source ip
-                [10,8,9,100],     //desitination ip
+                self.ip_addr, //source ip
+                [10, 0, 0, 81],     //desitination ip
                 128,
             ) //time to live
             .tcp(
@@ -223,13 +225,21 @@ impl XjpTcp {
 
 fn main() {
     let dev = Device::lookup().unwrap().unwrap();
+    // let dev = Device::list().unwrap().iter().find(|x| x.name == String::from("any")).unwrap().clone();
+    let ip_addr = match &dev.addresses[0].addr {
+        std::net::IpAddr::V4(addr) => {
+            addr.octets()
+        },
+        _ => { [0, 0, 0, 0] },
+    };// [127, 0, 0, 1];
+    
     let mut cap = Capture::from_device(dev)
         .unwrap()
         .timeout(1)
         .open()
         .unwrap();
     cap.filter("tcp", true).unwrap();
-
+    
     let pot = Honeypot::new();
     
     while let Ok(packet) = cap.next_packet() {
@@ -243,7 +253,7 @@ fn main() {
                         
                         if header.0.syn && !header.0.ack && !header.0.fin && !header.0.psh && header.0.destination_port == 21 {
                             let seq = header.0.sequence_number;
-                            let mut con = XjpTcp::from_state(XjpTcpState::SynRcvd, header.0.destination_port, header.0.source_port, seq);
+                            let mut con = XjpTcp::from_state(ip_addr, XjpTcpState::SynRcvd, header.0.destination_port, header.0.source_port, seq);
                             
                             con.write(b"Hello, World!\n", &mut cap).unwrap();
                         }
