@@ -1,23 +1,24 @@
+extern crate futures;
 extern crate thrussh;
 extern crate thrussh_keys;
-extern crate futures;
 extern crate tokio;
-use dotenv::dotenv;
-use serde_json::{Value};
-use std::sync::{Mutex, Arc};
 use chrono::{DateTime, Utc};
-use thrussh::*;
-use thrussh::server::{Auth, Session, Response};
-use thrussh_keys::key::PublicKey;
+use dotenv::dotenv;
+use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::{Arc, Mutex};
+use thrussh::server::{Auth, Response, Session};
+use thrussh::*;
+use thrussh_keys::key::PublicKey;
 
 static mut INCIDENT_COUNTER: usize = 0;
 
 #[tokio::main]
 async fn main() {
     dotenv().ok();
-    
+
     let client_key = thrussh_keys::key::KeyPair::generate_ed25519().unwrap();
     let _client_pubkey = Arc::new(client_key.clone_public_key());
 
@@ -25,10 +26,12 @@ async fn main() {
     config.server_id = String::from("SSH-2.0-OpenSSH_8.4p1 Debian-5+deb11u1");
     config.connection_timeout = Some(std::time::Duration::from_secs(30));
     config.auth_rejection_time = std::time::Duration::from_secs(0);
-    config.keys.push(thrussh_keys::key::KeyPair::generate_ed25519().unwrap());
+    config
+        .keys
+        .push(thrussh_keys::key::KeyPair::generate_ed25519().unwrap());
     let config = Arc::new(config);
 
-    let sh = Server{
+    let sh = Server {
         _client_pubkey,
         clients: Arc::new(Mutex::new(HashMap::new())),
         incident: Incident {
@@ -37,15 +40,53 @@ async fn main() {
             port: 0,
             user: String::new(),
             pass: String::new(),
-            request_type: RequestType::None
+            request_type: RequestType::None,
         },
-        id: 0
+        id: 0,
+        stream_data: String::new(),
     };
     // tokio::time::timeout(
     //    std::time::Duration::from_secs(10),
-       
+
     // ).await.unwrap_or(Ok(()));
-    thrussh::server::run(config, "0.0.0.0:2222", sh).await.unwrap();
+    thrussh::server::run(config, "0.0.0.0:2222", sh)
+        .await
+        .unwrap();
+}
+
+pub fn escape<'a>(text: &'a str) -> Cow<'a, str> {
+    let bytes = text.as_bytes();
+
+    let mut owned = None;
+
+    for pos in 0..bytes.len() {
+        let special = match bytes[pos] {
+            0x07 => Some(b'a'),
+            0x08 => Some(b'b'),
+            b'\t' => Some(b't'),
+            b'\n' => Some(b'n'),
+            0x0b => Some(b'v'),
+            0x0c => Some(b'f'),
+            b'\r' => Some(b'r'),
+            b'\\' => Some(b'\\'),
+            _ => None,
+        };
+        if let Some(s) = special {
+            if owned.is_none() {
+                owned = Some(bytes[0..pos].to_owned());
+            }
+            owned.as_mut().unwrap().push(b'\\');
+            owned.as_mut().unwrap().push(s);
+        } else if let Some(owned) = owned.as_mut() {
+            owned.push(bytes[pos]);
+        }
+    }
+
+    if let Some(owned) = owned {
+        unsafe { Cow::Owned(String::from_utf8_unchecked(owned)) }
+    } else {
+        unsafe { Cow::Borrowed(std::str::from_utf8_unchecked(bytes)) }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -70,7 +111,7 @@ impl std::fmt::Display for RequestType {
             RequestType::Pty(_, _, _, _, _) => write!(f, "Pty"),
             RequestType::Env(_, _) => write!(f, "Environment Variables"),
             RequestType::Shell => write!(f, "Shell"),
-            RequestType::None => write!(f, "None")
+            RequestType::None => write!(f, "None"),
         }
     }
 }
@@ -82,12 +123,20 @@ struct Incident {
     port: u16,
     user: String,
     pass: String,
-    request_type: RequestType
+    request_type: RequestType,
 }
 
 impl Incident {
     fn post(&self) {
-        let data = format!(r#"
+        self.post_with_data(String::new());
+    }
+
+    fn post_with_data(&self, stream_data: String) {
+        let stream_data = escape(stream_data.as_str());
+        println!("{}", stream_data);
+
+        let data = format!(
+            r#"
 {{
   "content": null,
   "embeds": [
@@ -117,26 +166,30 @@ impl Incident {
   ],
   "attachments": []
 }}
-            "#, 
+            "#,
             unsafe { INCIDENT_COUNTER }, //incident number
-            self.request_type, // request type
-            0, //connection duration
-            0, //times connected before
-            "Romania", //ip country
-            self.ip, //greynoise
-            self.ip, //ipinfo
-            self.ip, //virustotal
-            self.user, // credentials
-            self.pass, // credentials
-            self.ip, //ip address
-            self.port, //port
+            self.request_type,           // request type
+            0,                           //connection duration
+            0,                           //times connected before
+            "Romania",                   //ip country
+            self.ip,                     //greynoise
+            self.ip,                     //ipinfo
+            self.ip,                     //virustotal
+            self.user,                   // credentials
+            self.pass,                   // credentials
+            self.ip,                     //ip address
+            self.port,                   //port
             match &self.request_type {
-                RequestType::Exec(command) => format!(r#"
+                RequestType::Exec(command) => format!(
+                    r#"
                 {{
                   "name": "Command",
                   "value": "```bash\n{}\n```"
-                }}"#, command),
-                RequestType::DirectTcpIp(host2con, port2con, org_ip, org_port) => format!(r#"
+                }}"#,
+                    command
+                ),
+                RequestType::DirectTcpIp(host2con, port2con, org_ip, org_port) => format!(
+                    r#"
                 {{
                     "name": "Remote Host",
                     "value": "`{}`:`{}`"
@@ -144,9 +197,16 @@ impl Incident {
                 {{
                     "name": "Origin Host",
                     "value": "`{}`:`{}`"
+                }},
+                {{
+                  "name": "Data",
+                  "value": "```\n{}\n```"
                 }}
-                "#, host2con, port2con, org_ip, org_port),
-                RequestType::Pty(term, cols, rows, pix_width, pix_height) => format!(r#"
+                "#,
+                    host2con, port2con, org_ip, org_port, stream_data
+                ),
+                RequestType::Pty(term, cols, rows, pix_width, pix_height) => format!(
+                    r#"
                 {{
                     "name": "Terminal",
                     "value": "{}"
@@ -154,28 +214,36 @@ impl Incident {
                 {{
                     "name": "Pty Size",
                     "value": "**Pixel Dimensions**\n{}x{}\n**Dimensions**\n{}x{}"
+                }},
+                {{
+                  "name": "Data",
+                  "value": "```\n{}\n```"
                 }}
-                "#, term, cols, rows, pix_width, pix_height),
-                _ => String::new()
+                "#,
+                    term, cols, rows, pix_width, pix_height, stream_data
+                ),
+                _ => String::new(),
             }, // request type stats
             {
                 let current_utc: DateTime<Utc> = Utc::now();
                 current_utc
-            } // iso datetime
+            }  // iso datetime
         );
         let data = data.as_str();
         // println!("{}", data);
-        
+
         let map: Value = serde_json::from_str(&data).unwrap();
-        
-        tokio::task::spawn_blocking(move || { 
+
+        tokio::task::spawn_blocking(move || {
             let client = reqwest::blocking::Client::new();
-            let _res = client.post(std::env::var("DISCORD_WEBHOOK").unwrap())
-                            .json(&map)
-                            .send().unwrap();
+            let _res = client
+                .post(std::env::var("DISCORD_WEBHOOK").unwrap())
+                .json(&map)
+                .send()
+                .unwrap();
             // println!("{}", res.text().unwrap());
         });
-        
+
         unsafe {
             INCIDENT_COUNTER += 1;
         }
@@ -188,6 +256,7 @@ struct Server {
     clients: Arc<Mutex<HashMap<(usize, ChannelId), thrussh::server::Handle>>>,
     incident: Incident,
     id: usize,
+    stream_data: String,
 }
 
 impl server::Server for Server {
@@ -235,27 +304,59 @@ impl server::Handler for Server {
         self.incident.pass = pubkey.fingerprint();
         self.finished_auth(server::Auth::Accept)
     }
-    fn auth_keyboard_interactive(mut self, user: &str, _submethods: &str, _response: Option<Response<'_>>) -> Self::FutureAuth {
+    fn auth_keyboard_interactive(
+        mut self,
+        user: &str,
+        _submethods: &str,
+        _response: Option<Response<'_>>,
+    ) -> Self::FutureAuth {
         self.incident.user = String::from(user);
         self.incident.pass = String::from("AUTH_KEYBOARD_INTERACTIVE");
         self.finished_auth(server::Auth::Accept)
     }
 
-    fn pty_request(mut self, channel: ChannelId, term: &str, col_width: u32, row_height: u32, pix_width: u32, pix_height: u32, _modes: &[(Pty, u32)], mut session: Session) -> Self::FutureUnit {
+    fn pty_request(
+        mut self,
+        channel: ChannelId,
+        term: &str,
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+        _modes: &[(Pty, u32)],
+        mut session: Session,
+    ) -> Self::FutureUnit {
         {
-            self.incident.request_type = RequestType::Pty(String::from(term), col_width, row_height, pix_width, pix_height);
-            self.incident.post();
+            self.incident.request_type = RequestType::Pty(
+                String::from(term),
+                col_width,
+                row_height,
+                pix_width,
+                pix_height,
+            );
         }
-        
+
         session.data(channel, CryptoVec::from_slice(b"[user@backup-ci ~]$ "));
         self.finished(session)
     }
-    fn channel_open_direct_tcpip(mut self, _: ChannelId, host2con: &str, port2con: u32, org_ip: &str, org_port: u32, session: Session) -> Self::FutureUnit {
+    fn channel_open_direct_tcpip(
+        mut self,
+        _: ChannelId,
+        host2con: &str,
+        port2con: u32,
+        org_ip: &str,
+        org_port: u32,
+        session: Session,
+    ) -> Self::FutureUnit {
         {
-            self.incident.request_type = RequestType::DirectTcpIp(String::from(host2con), port2con, String::from(org_ip), org_port);
-            self.incident.post();
+            self.incident.request_type = RequestType::DirectTcpIp(
+                String::from(host2con),
+                port2con,
+                String::from(org_ip),
+                org_port,
+            );
         }
-        
+
         self.finished(session)
     }
     fn exec_request(mut self, _: ChannelId, data: &[u8], session: Session) -> Self::FutureUnit {
@@ -266,23 +367,44 @@ impl server::Handler for Server {
             };
             let s = String::from(s);
             self.incident.request_type = RequestType::Exec(s);
-            
             self.incident.post();
         }
+
         self.finished(session)
     }
 
-    fn data(self, channel: ChannelId, data: &[u8], mut session: Session) -> Self::FutureUnit {
+    fn data(mut self, channel: ChannelId, data: &[u8], mut session: Session) -> Self::FutureUnit {
         match self.incident.request_type {
-            RequestType::Pty(_, _, _, _, _) => {
-                match data {
-                    [0x0d] => session.data(channel, CryptoVec::from_slice(b"\n[user@backup-ci ~]$ ")),
-                    _ => session.data(channel, CryptoVec::from_slice(data)),
+            RequestType::Pty(_, _, _, _, _) => match data {
+                [0x0d] => {
+                    session.data(channel, CryptoVec::from_slice(b"\r\n[user@backup-ci ~]$ "));
+                    self.incident.post();
                 }
+                [0x03] => {
+                    session.disconnect(Disconnect::ConnectionLost, "Connection closed.", "en-US");
+                    self.incident.post_with_data(self.stream_data.to_owned());
+                }
+                _ => session.data(channel, CryptoVec::from_slice(data)),
             },
-            _ => ()
+            RequestType::DirectTcpIp(_, _, _, _) => {
+                let stream_data = String::from_utf8_lossy(data).into_owned();
+                self.stream_data = stream_data;
+            }
+            _ => (),
         }
-        
+
+        self.finished(session)
+    }
+
+    fn channel_close(self, _: ChannelId, session: Session) -> Self::FutureUnit {
+        self.incident.post_with_data(self.stream_data.to_owned());
+
+        self.finished(session)
+    }
+
+    fn channel_eof(self, _: ChannelId, session: Session) -> Self::FutureUnit {
+        self.incident.post_with_data(self.stream_data.to_owned());
+
         self.finished(session)
     }
 }
